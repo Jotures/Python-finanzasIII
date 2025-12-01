@@ -5,92 +5,118 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 import json
+from datetime import date
 
 # 1. CONFIGURACIÓN
-st.set_page_config(page_title="Finanzas en Vivo", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Finanzas 360", page_icon="💳", layout="wide")
 
-# 2. FUNCIÓN DE CONEXIÓN SEGURA
-# Usamos ttl=60 para que los datos se actualicen cada 60 segundos si hay cambios
-@st.cache_data(ttl=60)
-def cargar_datos_gsheets():
-    # Definimos el alcance de los permisos
+# 2. CONEXIÓN AL ROBOT (Backend)
+def conectar_google_sheets():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
-    # LÓGICA HÍBRIDA:
-    # Intento A: Buscar archivo local (Tu PC)
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-    # Intento B: Buscar secretos en la nube (Streamlit Cloud)
-# Intento B: Buscar secretos en la nube (Formato JSON String)
     elif "service_account_json" in st.secrets:
         creds_dict = json.loads(st.secrets["service_account_json"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     else:
-        st.error("❌ No se encontraron credenciales (ni locales ni en secretos).")
-        return pd.DataFrame() # Retorna vacío si falla
-
-    # Conectar y bajar datos
+        st.error("❌ Falta configuración de credenciales.")
+        return None
+    
     client = gspread.authorize(creds)
-    sheet = client.open("Finanzas Personales DB").sheet1
-    data = sheet.get_all_records()
-    return pd.DataFrame(data)
+    # Abre la hoja y selecciona la primera pestaña
+    return client.open("Finanzas Personales DB").sheet1
+
+# 3. LEER DATOS (Cache para rapidez)
+@st.cache_data(ttl=10) # Se actualiza cada 10 seg
+def cargar_datos():
+    sheet = conectar_google_sheets()
+    if sheet:
+        data = sheet.get_all_records()
+        return pd.DataFrame(data)
+    return pd.DataFrame()
+
+# 4. GUARDAR DATOS (Nueva función de escritura)
+def guardar_gasto(fecha, descripcion, categoria, monto):
+    sheet = conectar_google_sheets()
+    if sheet:
+        # append_row escribe una nueva fila al final
+        sheet.append_row([str(fecha), descripcion, categoria, monto])
+        # Limpiamos el caché para que el cambio se vea inmediato
+        st.cache_data.clear()
 
 try:
-    # Cargar datos
-    df = cargar_datos_gsheets()
+    # --- BARRA LATERAL: FORMULARIO DE INGRESO ---
+    st.sidebar.title("➕ Nuevo Movimiento")
+    
+    with st.sidebar.form(key="form_gasto"):
+        # Inputs del usuario
+        fecha_input = st.date_input("Fecha", date.today())
+        desc_input = st.text_input("Descripción (Ej: Taxi)")
+        
+        # Categorías predefinidas (puedes cambiarlas)
+        cats_disponibles = ['Comida', 'Transporte', 'Alquiler', 'Entretenimiento', 'Servicios', 'Salud', 'Otros']
+        cat_input = st.selectbox("Categoría", cats_disponibles)
+        
+        monto_input = st.number_input("Monto (S/)", min_value=0.01, format="%.2f")
+        
+        # Botón de envío
+        submit_button = st.form_submit_button(label="💾 Guardar Gasto")
 
-    # --- VERIFICACIÓN DE DATOS VACÍOS ---
+    # Lógica al presionar el botón
+    if submit_button:
+        if desc_input and monto_input > 0:
+            with st.spinner("Enviando a la nube..."):
+                guardar_gasto(fecha_input, desc_input, cat_input, monto_input)
+            st.success("✅ ¡Guardado!")
+            # Recargar la app para ver el cambio
+            st.rerun()
+        else:
+            st.sidebar.error("⚠️ Faltan datos (Descripción o Monto).")
+
+    st.sidebar.markdown("---")
+
+    # --- CUERPO PRINCIPAL: DASHBOARD ---
+    df = cargar_datos()
+
     if df.empty:
-        st.warning("⚠️ La hoja de cálculo está vacía o no se pudo leer.")
+        st.info("👋 Tu hoja de cálculo está vacía. ¡Usa el formulario de la izquierda para agregar tu primer gasto!")
         st.stop()
 
-    # --- SIDEBAR ---
-    st.sidebar.title("Filtros en Vivo")
-    
-    # Filtro de Categoría (Leemos las categorías reales que escribiste en Sheets)
-    if 'categoria' in df.columns:
-        cats = ['Todas'] + list(df['categoria'].unique())
-        cat_select = st.sidebar.selectbox("Categoría:", cats)
-        
-        if cat_select != 'Todas':
-            df = df[df['categoria'] == cat_select]
+    # Título
+    st.title("📊 Mi Billetera en Vivo")
 
-    # --- DASHBOARD ---
-    st.title("📡 Finanzas Personales (Google Sheets)")
-    st.caption("Los datos se actualizan desde tu hoja de cálculo.")
-    st.markdown("---")
+    # Filtros de visualización
+    st.sidebar.header("🔍 Filtros")
+    filtro_cat = st.sidebar.selectbox("Filtrar vista:", ["Todas"] + list(df['categoria'].unique()))
+    
+    df_view = df.copy()
+    if filtro_cat != "Todas":
+        df_view = df[df['categoria'] == filtro_cat]
 
     # KPIs
-    # Aseguramos que la columna monto sea numérica
-    df['monto'] = pd.to_numeric(df['monto'], errors='coerce').fillna(0)
+    # Convertir monto a números por si acaso
+    df_view['monto'] = pd.to_numeric(df_view['monto'], errors='coerce').fillna(0)
     
-    # Aquí asumo que tus datos en Sheets son TODOS gastos positivos.
-    # Si usas negativos, avísame. Por ahora sumamos todo como 'Gasto Total'.
-    total_gastado = df['monto'].sum()
-    movimientos = len(df)
+    total = df_view['monto'].sum()
+    promedio = df_view['monto'].mean()
 
     c1, c2 = st.columns(2)
-    c1.metric("Gasto Total Acumulado", f"S/ {total_gastado:,.2f}")
-    c2.metric("Movimientos Registrados", movimientos)
+    c1.metric("Total Gastado", f"S/ {total:,.2f}")
+    c2.metric("Gasto Promedio", f"S/ {promedio:,.2f}")
 
-    st.markdown("---")
-
-    # GRÁFICOS
-    col1, col2 = st.columns([2,1])
+    # Gráficos y Tabla
+    col_graf, col_tabla = st.columns([2, 1])
     
-    with col1:
-        st.subheader("Gasto por Categoría")
-        if not df.empty:
-            fig_bar = px.bar(df, x='categoria', y='monto', color='categoria')
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-    with col2:
+    with col_graf:
+        st.subheader("Desglose")
+        fig = px.pie(df_view, names='categoria', values='monto', hole=0.4)
+        st.plotly_chart(fig, use_container_width=True)
+        
+    with col_tabla:
         st.subheader("Últimos Registros")
-        # Mostramos las columnas más importantes
-        cols_ver = ['fecha', 'descripcion', 'monto']
-        # Filtramos solo las columnas que existen
-        cols_final = [c for c in cols_ver if c in df.columns]
-        st.dataframe(df[cols_final], hide_index=True)
+        # Mostramos los últimos 5 (tail) e invertimos el orden
+        st.dataframe(df_view.tail(10).iloc[::-1], hide_index=True)
 
 except Exception as e:
-    st.error(f"Ocurrió un error: {e}")
+    st.error(f"Algo salió mal: {e}")
